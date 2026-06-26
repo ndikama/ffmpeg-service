@@ -21,7 +21,7 @@ app.use((req, res, next) => {
 });
 
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'FFmpeg Assembly Service WF9b v2' });
+  res.json({ status: 'ok', service: 'FFmpeg Assembly Service WF9b v3' });
 });
 
 async function downloadFile(url, dest) {
@@ -38,15 +38,21 @@ async function downloadFile(url, dest) {
   });
 }
 
-// Get audio duration in seconds
 function getAudioDuration(filePath) {
   try {
     const output = execSync(
-      `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${filePath}"`
+      `ffprobe -v error -show_entries format=duration -of csv=p=0 "${filePath}"`,
+      { timeout: 10000 }
     ).toString().trim();
-    return Math.ceil(parseFloat(output));
+    const dur = parseFloat(output);
+    if (isNaN(dur) || dur <= 0) {
+      console.log('ffprobe returned invalid duration, using 90s fallback');
+      return 90;
+    }
+    return Math.ceil(dur);
   } catch(e) {
-    return 90; // fallback
+    console.log('ffprobe failed, using 90s fallback:', e.message);
+    return 90;
   }
 }
 
@@ -99,10 +105,12 @@ app.post('/assemble', async (req, res) => {
         await downloadFile(images[i], `${tmpDir}/image_${i + 1}.jpg`);
         console.log(`[${jobId}] Image ${i + 1} OK`);
       } catch(e) {
-        // Si une image échoue, copie la précédente
         console.log(`[${jobId}] Image ${i + 1} failed, using fallback`);
-        if (i > 0) {
+        if (i > 0 && fs.existsSync(`${tmpDir}/image_${i}.jpg`)) {
           fs.copyFileSync(`${tmpDir}/image_${i}.jpg`, `${tmpDir}/image_${i + 1}.jpg`);
+        } else {
+          // Create a black placeholder image
+          execSync(`ffmpeg -y -f lavfi -i color=black:size=1080x1920:duration=1 -vframes 1 "${tmpDir}/image_${i + 1}.jpg"`);
         }
       }
     }
@@ -111,15 +119,13 @@ app.post('/assemble', async (req, res) => {
     console.log(`[${jobId}] Downloading audio...`);
     await downloadFile(audio_url, `${tmpDir}/audio.mp3`);
 
-    // Get real audio duration
+    // Get real audio duration with safe fallback
     const audioDuration = getAudioDuration(`${tmpDir}/audio.mp3`);
-    console.log(`[${jobId}] Audio duration: ${audioDuration}s`);
+    const totalDuration = (!audioDuration || isNaN(audioDuration) || audioDuration <= 0) ? 90 : audioDuration;
+    const imgDuration = Math.max(1, Math.ceil(totalDuration / 6));
+    console.log(`[${jobId}] Audio: ${audioDuration}s → total: ${totalDuration}s, img: ${imgDuration}s each`);
 
-    // Calculate duration per image based on audio duration
-    const totalDuration = audioDuration;
-    const imgDuration = Math.ceil(audioDuration / 6);
-
-    // Write concat file with calculated durations
+    // Write concat file
     let concatContent = '';
     for (let i = 1; i <= 6; i++) {
       concatContent += `file '${tmpDir}/image_${i}.jpg'\nduration ${imgDuration}\n`;
@@ -139,21 +145,19 @@ app.post('/assemble', async (req, res) => {
     const outputPath = `${tmpDir}/output.mp4`;
     const fontFile = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf';
 
-    // CTA appears in last 15 seconds
-    const ctaStart = Math.max(totalDuration - 15, totalDuration * 0.75);
-    const declarationStart = Math.max(totalDuration - 20, totalDuration * 0.65);
+    // Safe time calculations
+    const ctaStart = Math.floor(Math.max(totalDuration - 15, totalDuration * 0.75));
+    const declarationStart = Math.floor(Math.max(totalDuration - 20, totalDuration * 0.65));
 
     const filters = [
       // Verset (0-10s)
       versetLine ? `drawtext=fontfile=${fontFile}:textfile='${tmpDir}/verset.txt':fontcolor=white:fontsize=34:box=1:boxcolor=black@0.65:boxborderw=10:x=(w-text_w)/2:y=h-160:enable='between(t,0,10)'` : '',
-      // Declaration (last 20s)
+      // Declaration
       declarationLine ? `drawtext=fontfile=${fontFile}:textfile='${tmpDir}/declaration.txt':fontcolor=gold:fontsize=32:box=1:boxcolor=black@0.65:boxborderw=10:x=(w-text_w)/2:y=h-200:enable='between(t,${declarationStart},${totalDuration})'` : '',
-      // CTA (last 15s) — GRAND et visible
+      // CTA grand et visible
       `drawtext=fontfile=${fontFile}:textfile='${tmpDir}/cta.txt':fontcolor=white:fontsize=46:box=1:boxcolor=black@0.8:boxborderw=14:x=(w-text_w)/2:y=h-110:enable='between(t,${ctaStart},${totalDuration})'`
     ].filter(f => f !== '').join(',');
 
-    // Ken Burns zoom effect per image using zoompan
-    // Each image gets a subtle zoom: alternate between zoom-in and zoom-out
     const ffmpegCmd = `ffmpeg -y \
       -f concat -safe 0 -i "${tmpDir}/images.txt" \
       -i "${tmpDir}/audio.mp3" \
@@ -165,7 +169,7 @@ app.post('/assemble', async (req, res) => {
       -pix_fmt yuv420p \
       "${outputPath}"`;
 
-    console.log(`[${jobId}] Running FFmpeg (duration: ${totalDuration}s)...`);
+    console.log(`[${jobId}] Running FFmpeg (${totalDuration}s)...`);
     execSync(ffmpegCmd, { timeout: 600000 });
     console.log(`[${jobId}] FFmpeg done`);
 
@@ -181,8 +185,7 @@ app.post('/assemble', async (req, res) => {
       success: true,
       video_url: videoUrl,
       job_id: jobId,
-      duration: totalDuration,
-      audio_duration: audioDuration
+      duration: totalDuration
     });
 
   } catch (error) {
