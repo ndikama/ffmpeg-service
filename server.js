@@ -86,7 +86,7 @@ async function uploadToDrive(filePath, fileName) {
     fileId, requestBody: { role: 'reader', type: 'anyone' }
   });
 
-  return `https://drive.google.com/uc?export=download&id=${fileId}`;
+  return `https://drive.google.com/file/d/${fileId}/view`;
 }
 
 function cleanText(text, maxLength = 60) {
