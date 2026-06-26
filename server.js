@@ -25,11 +25,26 @@ app.get('/', (req, res) => {
 });
 
 async function downloadFile(url, dest) {
+  // Handle Google Drive URLs specially
+  let downloadUrl = url;
+  if (url.includes('drive.google.com')) {
+    const idMatch = url.match(/id=([^&]+)/);
+    if (idMatch) {
+      downloadUrl = `https://drive.google.com/uc?export=download&confirm=t&id=${idMatch[1]}`;
+    }
+  }
+
   const response = await axios({
-    url, responseType: 'stream', timeout: 60000,
-    headers: { 'User-Agent': 'Mozilla/5.0' },
-    maxRedirects: 10
+    url: downloadUrl,
+    responseType: 'stream',
+    timeout: 120000,
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      'Accept': '*/*'
+    },
+    maxRedirects: 15
   });
+
   return new Promise((resolve, reject) => {
     const writer = fs.createWriteStream(dest);
     response.data.pipe(writer);
