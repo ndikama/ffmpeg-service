@@ -192,25 +192,36 @@ app.post('/assemble', async (req, res) => {
     let filterComplex = '';
  
     // Part A: per-image processing
-    // FIX: add format=yuv420p after zoompan to handle grayscale source images.
-    // Some images (historical B&W photos) are decoded as gray colorspace by FFmpeg.
-    // libx264 cannot encode gray directly into yuv420p — the explicit format filter
-    // converts every stream to yuv420p before the xfade/drawtext chain.
+    // FIX 1: format=yuv420p handles grayscale (gray) source images — libx264 cannot
+    //         encode gray directly.
+    // FIX 2: setsar=1 normalises the Sample Aspect Ratio. Mixed SAR values across
+    //         source images cause xfade's auto_scale to fail with "Failed to configure
+    //         output pad". Every stream must have identical dimensions, fps, pix_fmt
+    //         AND SAR before entering xfade.
     for (let i = 0; i < 6; i++) {
       filterComplex +=
-        `[${i}:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:10,format=yuv420p[bg${i}];` +
-        `[${i}:v]scale=1080:1920:force_original_aspect_ratio=decrease,format=yuv420p[fg${i}];` +
+        `[${i}:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,` +
+        `format=yuv420p,setsar=1[bg${i}];` +
+        `[${i}:v]scale=1080:1920:force_original_aspect_ratio=decrease,` +
+        `format=yuv420p,setsar=1[fg${i}];` +
         `[bg${i}][fg${i}]overlay=(W-w)/2:(H-h)/2,` +
-        `zoompan=z='min(zoom+0.0008,1.15)':d=${Math.ceil(25 * segmentDuration)}:s=1080x1920,fps=25,format=yuv420p[v${i}]; `;
+        `zoompan=z='min(zoom+0.0008,1.15)':d=${Math.ceil(25 * segmentDuration)}:s=1080x1920,` +
+        `fps=25,format=yuv420p,setsar=1[v${i}]; `;
     }
  
     // Part B: xfade chain
+    // Extra safety: pipe each [vi] through a no-op scale+setsar to guarantee xfade
+    // receives perfectly uniform streams even if a future image source is unusual.
     const transitionDuration = 1.0;
-    let currentStream = '[v0]';
+    // Normalise all v-streams before chaining
+    for (let i = 0; i < 6; i++) {
+      filterComplex += `[v${i}]scale=1080:1920,setsar=1,format=yuv420p[vn${i}]; `;
+    }
+    let currentStream = '[vn0]';
     for (let i = 1; i < 6; i++) {
       const offset = (i * stepDuration) - transitionDuration;
       const nextStream = i < 5 ? `[v_blend_${i}]` : `[v_blended]`;
-      filterComplex += `${currentStream}[v${i}]xfade=transition=fade:duration=${transitionDuration}:offset=${offset.toFixed(2)}${nextStream}; `;
+      filterComplex += `${currentStream}[vn${i}]xfade=transition=fade:duration=${transitionDuration}:offset=${offset.toFixed(2)}${nextStream}; `;
       currentStream = nextStream;
     }
  
