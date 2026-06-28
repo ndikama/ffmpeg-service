@@ -77,15 +77,29 @@ async function uploadToDrive(filePath, fileName) {
  
   const response = await drive.files.create({
     requestBody: { name: fileName, parents: [GOOGLE_DRIVE_FOLDER_ID] },
-    media: { mimeType: 'video/mp4', body: fs.createReadStream(filePath) }
+    media: { mimeType: 'video/mp4', body: fs.createReadStream(filePath) },
+    fields: 'id, name, size'
   });
  
   const fileId = response.data.id;
-  await drive.permissions.create({
-    fileId, requestBody: { role: 'reader', type: 'anyone' }
-  });
+  console.log(`[Drive] Upload OK — fileId: "${fileId}" (length: ${fileId ? fileId.length : 'null'}), name: ${response.data.name}, size: ${response.data.size}`);
  
-  return `https://drive.google.com/file/d/${fileId}/view`;
+  if (!fileId) throw new Error('Google Drive upload returned no fileId');
+ 
+  try {
+    await drive.permissions.create({
+      fileId,
+      requestBody: { role: 'reader', type: 'anyone' }
+    });
+    console.log(`[Drive] Permissions set to public OK`);
+  } catch (permErr) {
+    console.error(`[Drive] WARNING: failed to set permissions: ${permErr.message}`);
+    // Don't throw — file exists, just may need manual sharing
+  }
+ 
+  const url = `https://drive.google.com/file/d/${fileId}/view`;
+  console.log(`[Drive] Final URL: ${url}`);
+  return url;
 }
  
 // FIX: strip apostrophes and special chars that break FFmpeg drawtext parsing
