@@ -163,15 +163,31 @@ app.post('/assemble', async (req, res) => {
     const ctaStart         = Math.floor(Math.max(totalDuration - 12, totalDuration * 0.8));
     const declarationStart = Math.floor(Math.max(totalDuration - 22, totalDuration * 0.65));
  
-    let inputArgs = [];
-    for (let i = 1; i <= 6; i++) {
-      inputArgs.push(`-loop 1 -t ${segmentDuration} -i "${tmpDir}/image_${i}.jpg"`);
-    }
-    inputArgs.push(`-i "${tmpDir}/audio.mp3"`);
+    // ─── TWO-PASS STRATEGY ────────────────────────────────────────────────────
+    // xfade fails with "auto_scale: Failed to configure output pad" when source
+    // images have mixed colorspaces (gray vs yuvj420p vs yuvj444p) and mixed SAR
+    // values — zoompan in FFmpeg 5.1 does not reliably normalise these even with
+    // explicit format= and setsar= filters.
+    //
+    // Solution: PASS 1 converts each image into a fully-normalised intermediate
+    // MP4 clip (1080x1920, yuv420p, 25fps, SAR 1:1). PASS 2 concatenates the 6
+    // identical-spec clips with drawtext overlays and muxes with the audio.
+    // concat is far more tolerant than xfade for heterogeneous sources.
  
-    // ─── FIX: build drawtext filters joined with comma (no leading comma) ───
-    // Each filter is a plain string WITHOUT a leading comma.
-    // They will be chained AFTER the last xfade stream with commas between them.
+    // PASS 1 — convert each image to a normalised silent clip
+    console.log(`[${jobId}] Pass 1: normalising 6 image clips...`);
+    for (let i = 1; i <= 6; i++) {
+      const clipPath = `${tmpDir}/clip_${i}.mp4`;
+      const pass1Cmd = `ffmpeg -y \
+        -loop 1 -t ${segmentDuration} -i "${tmpDir}/image_${i}.jpg" \
+        -vf "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,format=yuv420p,setsar=1" \
+        -r 25 -c:v libx264 -preset ultrafast -crf 28 -an \
+        "${clipPath}"`;
+      execSync(pass1Cmd, { timeout: 120000 });
+      console.log(`[${jobId}] Clip ${i} OK`);
+    }
+ 
+    // Build drawtext filters for PASS 2
     const drawtextFilters = [];
     if (versetLine) {
       drawtextFilters.push(
@@ -186,58 +202,17 @@ app.post('/assemble', async (req, res) => {
     drawtextFilters.push(
       `drawtext=fontfile=${fontFile}:textfile='${tmpDir}/cta.txt':fontcolor=white:fontsize=44:box=1:boxcolor=black@0.8:boxborderw=14:x=(w-text_w)/2:y=h-140:enable='between(t,${ctaStart},${totalDuration})'`
     );
+    const textChain = drawtextFilters.join(',');
  
-    // ─── Build filter_complex ────────────────────────────────────────────────
+    // PASS 2 — concat 6 identical-spec clips + audio + drawtext
+    const clipInputs = Array.from({length: 6}, (_, i) => `-i "${tmpDir}/clip_${i+1}.mp4"`).join(' ');
+    const concatFilter = Array.from({length: 6}, (_, i) => `[${i}:v]`).join('') +
+      `concat=n=6:v=1:a=0[vconcat]; [vconcat]${textChain}[outv]`;
  
-    let filterComplex = '';
- 
-    // Part A: per-image processing
-    // FIX 1: format=yuv420p handles grayscale (gray) source images — libx264 cannot
-    //         encode gray directly.
-    // FIX 2: setsar=1 normalises the Sample Aspect Ratio. Mixed SAR values across
-    //         source images cause xfade's auto_scale to fail with "Failed to configure
-    //         output pad". Every stream must have identical dimensions, fps, pix_fmt
-    //         AND SAR before entering xfade.
-    for (let i = 0; i < 6; i++) {
-      filterComplex +=
-        `[${i}:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,` +
-        `format=yuv420p,setsar=1[bg${i}];` +
-        `[${i}:v]scale=1080:1920:force_original_aspect_ratio=decrease,` +
-        `format=yuv420p,setsar=1[fg${i}];` +
-        `[bg${i}][fg${i}]overlay=(W-w)/2:(H-h)/2,` +
-        `zoompan=z='min(zoom+0.0008,1.15)':d=${Math.ceil(25 * segmentDuration)}:s=1080x1920,` +
-        `fps=25,format=yuv420p,setsar=1[v${i}]; `;
-    }
- 
-    // Part B: xfade chain
-    // Extra safety: pipe each [vi] through a no-op scale+setsar to guarantee xfade
-    // receives perfectly uniform streams even if a future image source is unusual.
-    const transitionDuration = 1.0;
-    // Normalise all v-streams before chaining
-    for (let i = 0; i < 6; i++) {
-      filterComplex += `[v${i}]scale=1080:1920,setsar=1,format=yuv420p[vn${i}]; `;
-    }
-    let currentStream = '[vn0]';
-    for (let i = 1; i < 6; i++) {
-      const offset = (i * stepDuration) - transitionDuration;
-      const nextStream = i < 5 ? `[v_blend_${i}]` : `[v_blended]`;
-      filterComplex += `${currentStream}[vn${i}]xfade=transition=fade:duration=${transitionDuration}:offset=${offset.toFixed(2)}${nextStream}; `;
-      currentStream = nextStream;
-    }
- 
-    // Part C: drawtext chain
-    // FIX: currentStream is e.g. [v_blended], drawtext filters are chained with
-    // commas INSIDE the filter string, not prepended. The stream label goes at
-    // the very beginning, output label [outv] at the very end.
-    //
-    // Correct syntax:  [v_blended]drawtext=...,drawtext=...,drawtext=...[outv]
-    // Wrong syntax:    [v_blended],drawtext=...   ← comma after stream = empty filter
-    filterComplex += `${currentStream}${drawtextFilters.join(',')}[outv]`;
- 
-    // ─── FFmpeg command ───────────────────────────────────────────────────────
     const ffmpegCmd = `ffmpeg -y \
-      ${inputArgs.join(' ')} \
-      -filter_complex "${filterComplex}" \
+      ${clipInputs} \
+      -i "${tmpDir}/audio.mp3" \
+      -filter_complex "${concatFilter}" \
       -map "[outv]" \
       -map 6:a \
       -c:v libx264 -preset fast -crf 22 \
@@ -247,7 +222,7 @@ app.post('/assemble', async (req, res) => {
       -pix_fmt yuv420p \
       "${outputPath}"`;
  
-    console.log(`[${jobId}] Executing FFmpeg rendering...`);
+    console.log(`[${jobId}] Pass 2: assembling final video...`);
     execSync(ffmpegCmd, { timeout: 600000 });
     console.log(`[${jobId}] Render complete`);
  
