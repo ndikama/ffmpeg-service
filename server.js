@@ -192,12 +192,16 @@ app.post('/assemble', async (req, res) => {
     let filterComplex = '';
  
     // Part A: per-image processing
+    // FIX: add format=yuv420p after zoompan to handle grayscale source images.
+    // Some images (historical B&W photos) are decoded as gray colorspace by FFmpeg.
+    // libx264 cannot encode gray directly into yuv420p — the explicit format filter
+    // converts every stream to yuv420p before the xfade/drawtext chain.
     for (let i = 0; i < 6; i++) {
       filterComplex +=
-        `[${i}:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:10[bg${i}];` +
-        `[${i}:v]scale=1080:1920:force_original_aspect_ratio=decrease[fg${i}];` +
+        `[${i}:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:10,format=yuv420p[bg${i}];` +
+        `[${i}:v]scale=1080:1920:force_original_aspect_ratio=decrease,format=yuv420p[fg${i}];` +
         `[bg${i}][fg${i}]overlay=(W-w)/2:(H-h)/2,` +
-        `zoompan=z='min(zoom+0.0008,1.15)':d=${Math.ceil(25 * segmentDuration)}:s=1080x1920,fps=25[v${i}]; `;
+        `zoompan=z='min(zoom+0.0008,1.15)':d=${Math.ceil(25 * segmentDuration)}:s=1080x1920,fps=25,format=yuv420p[v${i}]; `;
     }
  
     // Part B: xfade chain
@@ -266,4 +270,3 @@ app.listen(PORT, () => {
     console.error('Critical warning: FFmpeg binary not found on this system!');
   }
 });
- 
