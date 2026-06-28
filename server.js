@@ -1,272 +1,334 @@
 const express = require('express');
-const axios = require('axios');
-const { execSync } = require('child_process');
+const { exec } = require('child_process');
 const fs = require('fs');
+const path = require('path');
+const https = require('https');
+const http = require('http');
 const { google } = require('googleapis');
- 
+
 const app = express();
-app.use(express.json({ limit: '50mb' }));
- 
-const PORT = process.env.PORT || 3000;
-const API_KEY = process.env.API_KEY || 'wf9b-secret-key';
-const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
-const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
-const GOOGLE_REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN;
-const GOOGLE_DRIVE_FOLDER_ID = process.env.GOOGLE_DRIVE_FOLDER_ID;
- 
+app.use(express.json({ limit: '10mb' }));
+
+const API_KEY = process.env.API_KEY || 'wf9b-secret-key-change-this';
+const DRIVE_FOLDER_ID = process.env.GOOGLE_DRIVE_FOLDER_ID;
+const TMP = '/tmp/wf10';
+
+// ─────────────────────────────────────────────
+// Auth Google Drive
+// ─────────────────────────────────────────────
+function getDriveClient() {
+  const auth = new google.auth.OAuth2(
+    process.env.GOOGLE_CLIENT_ID,
+    process.env.GOOGLE_CLIENT_SECRET
+  );
+  auth.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
+  return google.drive({ version: 'v3', auth });
+}
+
+// ─────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────
+function ensureDir(dir) {
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+}
+
+function downloadFile(url, dest) {
+  return new Promise((resolve, reject) => {
+    const proto = url.startsWith('https') ? https : http;
+    const file = fs.createWriteStream(dest);
+    proto.get(url, res => {
+      if (res.statusCode === 301 || res.statusCode === 302) {
+        file.close();
+        return downloadFile(res.headers.location, dest).then(resolve).catch(reject);
+      }
+      res.pipe(file);
+      file.on('finish', () => file.close(resolve));
+    }).on('error', err => {
+      fs.unlink(dest, () => {});
+      reject(err);
+    });
+  });
+}
+
+function runFFmpeg(cmd) {
+  return new Promise((resolve, reject) => {
+    exec(cmd, { maxBuffer: 50 * 1024 * 1024 }, (err, stdout, stderr) => {
+      if (err) return reject(new Error(stderr || err.message));
+      resolve(stdout);
+    });
+  });
+}
+
+async function uploadToDrive(filePath, fileName) {
+  const drive = getDriveClient();
+  const res = await drive.files.create({
+    requestBody: { name: fileName, parents: [DRIVE_FOLDER_ID] },
+    media: { mimeType: 'video/mp4', body: fs.createReadStream(filePath) },
+    fields: 'id'
+  });
+  await drive.permissions.create({
+    fileId: res.data.id,
+    requestBody: { role: 'reader', type: 'anyone' }
+  });
+  return `https://drive.google.com/uc?export=download&id=${res.data.id}`;
+}
+
+// ─────────────────────────────────────────────
+// Authentification API
+// ─────────────────────────────────────────────
 app.use((req, res, next) => {
-  const key = req.headers['x-api-key'];
-  if (key !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
+  if (req.headers['x-api-key'] !== API_KEY) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
   next();
 });
- 
-app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'FFmpeg Assembly Service WF9b v5 (Premium Cinematic Slideshow)' });
-});
- 
-async function downloadFile(url, dest) {
-  let downloadUrl = url;
-  if (url.includes('drive.google.com')) {
-    const idMatch = url.match(/id=([^&]+)/);
-    if (idMatch) {
-      downloadUrl = `https://drive.google.com/uc?export=download&confirm=t&id=${idMatch[1]}`;
-    }
-  }
- 
-  const response = await axios({
-    url: downloadUrl,
-    responseType: 'stream',
-    timeout: 120000,
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-      'Accept': '*/*'
-    },
-    maxRedirects: 15
-  });
- 
-  return new Promise((resolve, reject) => {
-    const writer = fs.createWriteStream(dest);
-    response.data.pipe(writer);
-    writer.on('finish', resolve);
-    writer.on('error', reject);
-  });
-}
- 
-function getAudioDuration(filePath) {
-  try {
-    const output = execSync(
-      `ffprobe -v error -show_entries format=duration -of csv=p=0 "${filePath}"`,
-      { timeout: 10000 }
-    ).toString().trim();
-    const dur = parseFloat(output);
-    if (isNaN(dur) || dur <= 0) {
-      console.log('ffprobe returned invalid duration, using 60s fallback');
-      return 60;
-    }
-    return Math.ceil(dur);
-  } catch(e) {
-    console.log('ffprobe failed, using 60s fallback:', e.message);
-    return 60;
-  }
-}
- 
-async function uploadToDrive(filePath, fileName) {
-  const oauth2Client = new google.auth.OAuth2(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET);
-  oauth2Client.setCredentials({ refresh_token: GOOGLE_REFRESH_TOKEN });
-  const drive = google.drive({ version: 'v3', auth: oauth2Client });
- 
-  const response = await drive.files.create({
-    requestBody: { name: fileName, parents: [GOOGLE_DRIVE_FOLDER_ID] },
-    media: { mimeType: 'video/mp4', body: fs.createReadStream(filePath) },
-    fields: 'id, name, size'
-  });
- 
-  const fileId = response.data.id;
-  console.log(`[Drive] Upload OK — fileId: "${fileId}" (length: ${fileId ? fileId.length : 'null'}), name: ${response.data.name}, size: ${response.data.size}`);
- 
-  if (!fileId) throw new Error('Google Drive upload returned no fileId');
- 
-  try {
-    await drive.permissions.create({
-      fileId,
-      requestBody: { role: 'reader', type: 'anyone' }
-    });
-    console.log(`[Drive] Permissions set to public OK`);
-  } catch (permErr) {
-    console.error(`[Drive] WARNING: failed to set permissions: ${permErr.message}`);
-    // Don't throw — file exists, just may need manual sharing
-  }
- 
-  const url = `https://drive.google.com/file/d/${fileId}/view`;
-  console.log(`[Drive] Final URL: ${url}`);
-  return url;
-}
- 
-// FIX: strip apostrophes and special chars that break FFmpeg drawtext parsing
-function cleanText(text, maxLength = 60) {
-  if (!text) return '';
-  return text
-    .substring(0, maxLength)
-    .replace(/[\r\n]+/g, ' ')
-    .replace(/'/g, ' ')    // apostrophe droite
-    .replace(/'/g, ' ')    // apostrophe typographique
-    .replace(/'/g, ' ')    // apostrophe unicode alternative
-    .replace(/"/g, ' ')
-    .replace(/"/g, ' ')
-    .replace(/\\/g, ' ')
-    .replace(/[<>|&;`${}[\]]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
- 
-app.post('/assemble', async (req, res) => {
+
+// ─────────────────────────────────────────────
+// Healthcheck
+// ─────────────────────────────────────────────
+app.get('/health', (req, res) => res.json({ status: 'ok', version: '2.0' }));
+
+// ─────────────────────────────────────────────
+// GET Audio Duration
+// ─────────────────────────────────────────────
+app.post('/get-duration', async (req, res) => {
+  const { audio_url } = req.body;
   const jobId = Date.now().toString();
-  const tmpDir = `/tmp/wf9b_${jobId}`;
- 
+  const dir = path.join(TMP, jobId);
+  ensureDir(dir);
+  const audioFile = path.join(dir, 'audio.mp3');
+
   try {
-    const {
-      image_1_url, image_2_url, image_3_url,
-      image_4_url, image_5_url, image_6_url,
-      audio_url, verset, reference, declaration,
-      duration_per_image = 10
-    } = req.body;
- 
-    const images = [image_1_url, image_2_url, image_3_url,
-                    image_4_url, image_5_url, image_6_url];
-    if (images.some(u => !u)) return res.status(400).json({ error: 'Missing image URLs' });
-    if (!audio_url) return res.status(400).json({ error: 'Missing audio_url' });
- 
-    fs.mkdirSync(tmpDir, { recursive: true });
- 
-    console.log(`[${jobId}] Downloading 6 images...`);
-    for (let i = 0; i < images.length; i++) {
-      try {
-        await downloadFile(images[i], `${tmpDir}/image_${i + 1}.jpg`);
-        console.log(`[${jobId}] Image ${i + 1} OK`);
-      } catch(e) {
-        console.log(`[${jobId}] Image ${i + 1} failed, creating fallback`);
-        if (i > 0 && fs.existsSync(`${tmpDir}/image_${i}.jpg`)) {
-          fs.copyFileSync(`${tmpDir}/image_${i}.jpg`, `${tmpDir}/image_${i + 1}.jpg`);
-        } else {
-          execSync(`ffmpeg -y -f lavfi -i color=black:size=1080x1920:duration=1 -vframes 1 "${tmpDir}/image_${i + 1}.jpg"`);
+    await downloadFile(audio_url, audioFile);
+    const duration = await new Promise((resolve, reject) => {
+      exec(
+        `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${audioFile}"`,
+        (err, stdout) => {
+          if (err) return reject(err);
+          resolve(parseFloat(stdout.trim()));
         }
+      );
+    });
+    fs.rmSync(dir, { recursive: true, force: true });
+    res.json({ success: true, duration_seconds: Math.round(duration) });
+  } catch (e) {
+    fs.rmSync(dir, { recursive: true, force: true });
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────
+// ROUTE PRINCIPALE — Assemble Documentary
+// ─────────────────────────────────────────────
+// Reçoit :
+// {
+//   personnage, audio_url, duree_totale,
+//   watermark_text, cta_texte, cta_debut,
+//   scenes: [{ scene, duree, image_url, texte_affiche, effet, transition }]
+// }
+// ─────────────────────────────────────────────
+app.post('/assemble-documentary', async (req, res) => {
+  const {
+    personnage,
+    audio_url,
+    duree_totale,
+    watermark_text = 'Kingdom Fire',
+    cta_texte = '👍 Like  🔔 Abonne-toi  📖 Partage',
+    cta_debut,
+    scenes
+  } = req.body;
+
+  if (!audio_url || !scenes || scenes.length === 0) {
+    return res.status(400).json({ error: 'audio_url et scenes sont requis' });
+  }
+
+  const jobId = Date.now().toString();
+  const dir = path.join(TMP, jobId);
+  ensureDir(dir);
+
+  console.log(`[${jobId}] Démarrage — ${personnage} — ${scenes.length} scènes`);
+
+  try {
+    // ── 1. Télécharger audio ──────────────────
+    const audioFile = path.join(dir, 'audio.mp3');
+    console.log(`[${jobId}] Téléchargement audio...`);
+    await downloadFile(audio_url, audioFile);
+
+    // ── 2. Télécharger toutes les images ──────
+    console.log(`[${jobId}] Téléchargement ${scenes.length} images...`);
+    const imageFiles = [];
+
+    for (let i = 0; i < scenes.length; i++) {
+      const scene = scenes[i];
+      const imgPath = path.join(dir, `img_${String(i).padStart(3, '0')}.jpg`);
+
+      if (scene.image_url) {
+        try {
+          await downloadFile(scene.image_url, imgPath);
+          // Vérifier que le fichier est valide
+          const stats = fs.statSync(imgPath);
+          if (stats.size < 1000) throw new Error('Image trop petite');
+          imageFiles.push({ path: imgPath, scene });
+        } catch (e) {
+          console.warn(`[${jobId}] Image ${i} échouée — utilisation placeholder`);
+          // Créer un placeholder coloré avec FFmpeg
+          const color = getEmotionColor(scene.emotion || 'neutral');
+          await runFFmpeg(
+            `ffmpeg -f lavfi -i color=${color}:size=1080x1920:duration=1 -vframes 1 "${imgPath}" -y`
+          );
+          imageFiles.push({ path: imgPath, scene });
+        }
+      } else {
+        const color = getEmotionColor(scene.emotion || 'neutral');
+        await runFFmpeg(
+          `ffmpeg -f lavfi -i color=${color}:size=1080x1920:duration=1 -vframes 1 "${imgPath}" -y`
+        );
+        imageFiles.push({ path: imgPath, scene });
       }
     }
- 
-    console.log(`[${jobId}] Downloading audio...`);
-    await downloadFile(audio_url, `${tmpDir}/audio.mp3`);
- 
-    const audioDuration = getAudioDuration(`${tmpDir}/audio.mp3`);
-    const totalDuration = (!audioDuration || isNaN(audioDuration) || audioDuration <= 0) ? 60 : audioDuration;
- 
-    const stepDuration = totalDuration / 6;
-    const segmentDuration = Math.ceil(stepDuration + 2);
-    console.log(`[${jobId}] Audio: ${audioDuration}s | Step: ${stepDuration}s | Loop: ${segmentDuration}s`);
- 
-    const versetLine  = cleanText(`${reference || ''} - ${verset || ''}`, 65);
-    const declarationLine = cleanText(declaration || '', 75);
-    const ctaLine = 'Like  Abonne-toi  Partage  Nouvel episode demain';
- 
-    fs.writeFileSync(`${tmpDir}/verset.txt`,     versetLine);
-    fs.writeFileSync(`${tmpDir}/declaration.txt`, declarationLine);
-    fs.writeFileSync(`${tmpDir}/cta.txt`,         ctaLine);
- 
-    const outputPath = `${tmpDir}/output.mp4`;
-    const fontFile   = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf';
- 
-    const ctaStart         = Math.floor(Math.max(totalDuration - 12, totalDuration * 0.8));
-    const declarationStart = Math.floor(Math.max(totalDuration - 22, totalDuration * 0.65));
- 
-    // ─── TWO-PASS STRATEGY ────────────────────────────────────────────────────
-    // xfade fails with "auto_scale: Failed to configure output pad" when source
-    // images have mixed colorspaces (gray vs yuvj420p vs yuvj444p) and mixed SAR
-    // values — zoompan in FFmpeg 5.1 does not reliably normalise these even with
-    // explicit format= and setsar= filters.
-    //
-    // Solution: PASS 1 converts each image into a fully-normalised intermediate
-    // MP4 clip (1080x1920, yuv420p, 25fps, SAR 1:1). PASS 2 concatenates the 6
-    // identical-spec clips with drawtext overlays and muxes with the audio.
-    // concat is far more tolerant than xfade for heterogeneous sources.
- 
-    // PASS 1 — convert each image to a normalised silent clip
-    console.log(`[${jobId}] Pass 1: normalising 6 image clips...`);
-    for (let i = 1; i <= 6; i++) {
-      const clipPath = `${tmpDir}/clip_${i}.mp4`;
-      const pass1Cmd = `ffmpeg -y \
-        -loop 1 -t ${segmentDuration} -i "${tmpDir}/image_${i}.jpg" \
-        -vf "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,format=yuv420p,setsar=1" \
-        -r 25 -c:v libx264 -preset ultrafast -crf 28 -an \
-        "${clipPath}"`;
-      execSync(pass1Cmd, { timeout: 120000 });
-      console.log(`[${jobId}] Clip ${i} OK`);
+
+    // ── 3. Générer un clip vidéo par scène ────
+    console.log(`[${jobId}] Génération des clips...`);
+    const clipFiles = [];
+
+    for (let i = 0; i < imageFiles.length; i++) {
+      const { path: imgPath, scene } = imageFiles[i];
+      const clipPath = path.join(dir, `clip_${String(i).padStart(3, '0')}.mp4`);
+      const duree = scene.duree || 5;
+      const effet = scene.effet || 'zoom_in';
+
+      // Texte sous-titre pour cette scène
+      const texte = (scene.texte_affiche || '').replace(/'/g, "\\'").replace(/:/g, '\\:');
+
+      // Filtre Ken Burns selon l'effet
+      const kenBurns = getKenBurnsFilter(effet, duree);
+
+      // Filtre sous-titre
+      const subtitleFilter = texte
+        ? `,drawtext=text='${texte}':fontsize=42:fontcolor=white:` +
+          `shadowcolor=black:shadowx=2:shadowy=2:` +
+          `x=(w-text_w)/2:y=h-200:` +
+          `font='DejaVu-Sans-Bold':` +
+          `box=1:boxcolor=black@0.5:boxborderw=12`
+        : '';
+
+      const cmd =
+        `ffmpeg -loop 1 -i "${imgPath}" ` +
+        `-t ${duree} ` +
+        `-vf "scale=1080:1920:force_original_aspect_ratio=increase,` +
+        `crop=1080:1920,${kenBurns}${subtitleFilter},format=yuv420p" ` +
+        `-r 30 -c:v libx264 -preset fast -crf 23 ` +
+        `"${clipPath}" -y`;
+
+      await runFFmpeg(cmd);
+      clipFiles.push(clipPath);
     }
- 
-    // Build drawtext filters for PASS 2
-    const drawtextFilters = [];
-    if (versetLine) {
-      drawtextFilters.push(
-        `drawtext=fontfile=${fontFile}:textfile='${tmpDir}/verset.txt':fontcolor=white:fontsize=34:box=1:boxcolor=black@0.65:boxborderw=10:x=(w-text_w)/2:y=h-240:enable='between(t,0,10)'`
-      );
-    }
-    if (declarationLine) {
-      drawtextFilters.push(
-        `drawtext=fontfile=${fontFile}:textfile='${tmpDir}/declaration.txt':fontcolor=gold:fontsize=32:box=1:boxcolor=black@0.65:boxborderw=10:x=(w-text_w)/2:y=h-300:enable='between(t,${declarationStart},${totalDuration})'`
-      );
-    }
-    drawtextFilters.push(
-      `drawtext=fontfile=${fontFile}:textfile='${tmpDir}/cta.txt':fontcolor=white:fontsize=44:box=1:boxcolor=black@0.8:boxborderw=14:x=(w-text_w)/2:y=h-140:enable='between(t,${ctaStart},${totalDuration})'`
+
+    // ── 4. Ajouter clip CTA final ─────────────
+    const ctaPath = path.join(dir, 'clip_cta.mp4');
+    const ctaTexte = cta_texte.replace(/'/g, "\\'").replace(/:/g, '\\:');
+    await runFFmpeg(
+      `ffmpeg -f lavfi -i color=0x1a1a2e:size=1080x1920:duration=8 ` +
+      `-vf "drawtext=text='${ctaTexte}':fontsize=52:fontcolor=white:` +
+      `x=(w-text_w)/2:y=(h-text_h)/2:font='DejaVu-Sans-Bold':` +
+      `shadowcolor=black:shadowx=3:shadowy=3,` +
+      `drawtext=text='${watermark_text}':fontsize=36:fontcolor=gold:` +
+      `x=(w-text_w)/2:y=h-120:font='DejaVu-Sans-Bold',` +
+      `format=yuv420p" ` +
+      `-r 30 -c:v libx264 -preset fast -crf 23 "${ctaPath}" -y`
     );
-    const textChain = drawtextFilters.join(',');
- 
-    // PASS 2 — concat 6 identical-spec clips + audio + drawtext
-    const clipInputs = Array.from({length: 6}, (_, i) => `-i "${tmpDir}/clip_${i+1}.mp4"`).join(' ');
-    const concatFilter = Array.from({length: 6}, (_, i) => `[${i}:v]`).join('') +
-      `concat=n=6:v=1:a=0[vconcat]; [vconcat]${textChain}[outv]`;
- 
-    const ffmpegCmd = `ffmpeg -y \
-      ${clipInputs} \
-      -i "${tmpDir}/audio.mp3" \
-      -filter_complex "${concatFilter}" \
-      -map "[outv]" \
-      -map 6:a \
-      -c:v libx264 -preset fast -crf 22 \
-      -c:a aac -b:a 192k \
-      -t ${totalDuration} \
-      -movflags +faststart \
-      -pix_fmt yuv420p \
-      "${outputPath}"`;
- 
-    console.log(`[${jobId}] Pass 2: assembling final video...`);
-    execSync(ffmpegCmd, { timeout: 600000 });
-    console.log(`[${jobId}] Render complete`);
- 
-    console.log(`[${jobId}] Uploading to Drive...`);
-    const fileName = `heros_foi_${jobId}.mp4`;
-    const videoUrl = await uploadToDrive(outputPath, fileName);
-    console.log(`[${jobId}] Done: ${videoUrl}`);
- 
-    fs.rmSync(tmpDir, { recursive: true, force: true });
- 
+    clipFiles.push(ctaPath);
+
+    // ── 5. Concaténer tous les clips ──────────
+    console.log(`[${jobId}] Concaténation ${clipFiles.length} clips...`);
+    const listFile = path.join(dir, 'clips.txt');
+    fs.writeFileSync(
+      listFile,
+      clipFiles.map(f => `file '${f}'`).join('\n')
+    );
+
+    const videoNoAudio = path.join(dir, 'video_no_audio.mp4');
+    await runFFmpeg(
+      `ffmpeg -f concat -safe 0 -i "${listFile}" ` +
+      `-c:v libx264 -preset fast -crf 22 ` +
+      `"${videoNoAudio}" -y`
+    );
+
+    // ── 6. Mixer avec l'audio ─────────────────
+    console.log(`[${jobId}] Mixage audio...`);
+    const finalVideo = path.join(dir, `${personnage.replace(/\s+/g, '_')}_${jobId}.mp4`);
+    await runFFmpeg(
+      `ffmpeg -i "${videoNoAudio}" -i "${audioFile}" ` +
+      `-c:v copy -c:a aac -b:a 192k ` +
+      `-shortest -map 0:v:0 -map 1:a:0 ` +
+      `"${finalVideo}" -y`
+    );
+
+    // ── 7. Upload Google Drive ────────────────
+    console.log(`[${jobId}] Upload Drive...`);
+    const fileName = `${personnage}_${new Date().toISOString().split('T')[0]}.mp4`;
+    const driveUrl = await uploadToDrive(finalVideo, fileName);
+
+    // ── 8. Nettoyage ──────────────────────────
+    fs.rmSync(dir, { recursive: true, force: true });
+
+    console.log(`[${jobId}] ✅ Terminé — ${driveUrl}`);
     res.json({
       success: true,
-      video_url: videoUrl,
+      video_url: driveUrl,
       job_id: jobId,
-      duration: totalDuration
+      personnage,
+      nombre_scenes: scenes.length,
+      duree_totale
     });
- 
-  } catch (error) {
-    console.error(`[${jobId}] Render Error:`, error.message);
-    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch(e) {}
-    res.status(500).json({ error: error.message });
+
+  } catch (err) {
+    console.error(`[${jobId}] ❌ Erreur:`, err.message);
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) {}
+    res.status(500).json({ error: err.message, job_id: jobId });
   }
 });
- 
-app.listen(PORT, () => {
-  console.log(`FFmpeg Assembly Service listening on port ${PORT}`);
-  try {
-    const v = execSync('ffmpeg -version').toString().split('\n')[0];
-    console.log(`FFmpeg binary validated: ${v}`);
-  } catch(e) {
-    console.error('Critical warning: FFmpeg binary not found on this system!');
+
+// ─────────────────────────────────────────────
+// Helpers effets Ken Burns
+// ─────────────────────────────────────────────
+function getKenBurnsFilter(effet, duree) {
+  const frames = duree * 30;
+  switch (effet) {
+    case 'zoom_in':
+      return `zoompan=z='min(zoom+0.0015,1.3)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${frames}:s=1080x1920:fps=30`;
+    case 'zoom_out':
+      return `zoompan=z='if(lte(zoom,1.0),1.3,max(zoom-0.0015,1.0))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${frames}:s=1080x1920:fps=30`;
+    case 'pan_left':
+      return `zoompan=z='1.2':x='iw/2-(iw/zoom/2)+t*8':y='ih/2-(ih/zoom/2)':d=${frames}:s=1080x1920:fps=30`;
+    case 'pan_right':
+      return `zoompan=z='1.2':x='max(iw/2-(iw/zoom/2)-t*8,0)':y='ih/2-(ih/zoom/2)':d=${frames}:s=1080x1920:fps=30`;
+    case 'tilt_up':
+      return `zoompan=z='1.2':x='iw/2-(iw/zoom/2)':y='max(ih/2-(ih/zoom/2)-t*8,0)':d=${frames}:s=1080x1920:fps=30`;
+    case 'still':
+    default:
+      return `zoompan=z='1.0':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${frames}:s=1080x1920:fps=30`;
   }
-});
+}
+
+// ─────────────────────────────────────────────
+// Couleur placeholder selon émotion
+// ─────────────────────────────────────────────
+function getEmotionColor(emotion) {
+  const colors = {
+    hope: '0x1a3a5c',
+    fire: '0x3d1a00',
+    peace: '0x1a3d2e',
+    power: '0x2d1a4a',
+    discovery: '0x1a2d4a',
+    neutral: '0x1a1a2e'
+  };
+  return colors[emotion] || colors.neutral;
+}
+
+// ─────────────────────────────────────────────
+// Démarrage
+// ─────────────────────────────────────────────
+ensureDir(TMP);
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`WF10 FFmpeg Server démarré sur port ${PORT}`));
