@@ -157,11 +157,14 @@ async function buildDocumentaryVideo({
   // concat/xfade with heterogeneous web image sources)
   console.log(`[${jobId}] Pass 1: normalising ${nImages} clips...`);
   for (let i = 1; i <= nImages; i++) {
-    execSync(`ffmpeg -y \
+    const cmd1 = `ffmpeg -y \
       -loop 1 -t ${imgDuration.toFixed(2)} -i "${tmpDir}/image_${i}.jpg" \
       -vf "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,format=yuv420p,setsar=1" \
       -r 25 -c:v libx264 -preset ultrafast -crf 28 -an \
-      "${tmpDir}/clip_${i}.mp4"`, { timeout: 60000, maxBuffer: 1024 * 1024 * 50 });
+      "${tmpDir}/clip_${i}.mp4"`;
+    const scriptPath1 = `${tmpDir}/run_pass1_${i}.sh`;
+    fs.writeFileSync(scriptPath1, `#!/bin/sh\nset -e\n${cmd1}\n`);
+    execSync(`sh "${scriptPath1}"`, { timeout: 60000, maxBuffer: 1024 * 1024 * 50 });
   }
   console.log(`[${jobId}] Pass 1 complete`);
  
@@ -200,10 +203,16 @@ async function buildDocumentaryVideo({
   const outputPath = `${tmpDir}/output.mp4`;
  
   console.log(`[${jobId}] Pass 2: assembling final video (${nImages} clips, ${totalDuration}s)...`);
-  execSync(`ffmpeg -y \
+  // Write filter_complex to its own file too — with 25 images the filter string
+  // itself can be several KB, which some shells/Docker images choke on even
+  // inside a script. -filter_complex_script reads it directly from disk.
+  const filterScriptPath = `${tmpDir}/filter_complex.txt`;
+  fs.writeFileSync(filterScriptPath, concatFilter);
+ 
+  const ffmpegCmd2 = `ffmpeg -y \
     ${clipInputs} \
     -i "${tmpDir}/audio.mp3" \
-    -filter_complex "${concatFilter}" \
+    -filter_complex_script "${filterScriptPath}" \
     -map "[outv]" \
     -map ${nImages}:a \
     -c:v libx264 -preset fast -crf 22 \
@@ -211,7 +220,10 @@ async function buildDocumentaryVideo({
     -t ${totalDuration} \
     -movflags +faststart \
     -pix_fmt yuv420p \
-    "${outputPath}"`, { timeout: 900000, maxBuffer: 1024 * 1024 * 100 });
+    "${outputPath}"`;
+  const scriptPath2 = `${tmpDir}/run_pass2.sh`;
+  fs.writeFileSync(scriptPath2, `#!/bin/sh\nset -e\n${ffmpegCmd2}\n`);
+  execSync(`sh "${scriptPath2}"`, { timeout: 900000, maxBuffer: 1024 * 1024 * 100 });
   console.log(`[${jobId}] Render complete`);
  
   return { outputPath, totalDuration, nImages };
@@ -315,4 +327,3 @@ app.listen(PORT, () => {
     const v = execSync('ffmpeg -version').toString().split('\n')[0];
     console.log(`FFmpeg: ${v}`);
   } catch(e) { console.error('FFmpeg not found!'); }
-});
