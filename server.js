@@ -54,7 +54,7 @@ function getAudioDuration(filePath) {
   try {
     const output = execSync(
       `ffprobe -v error -show_entries format=duration -of csv=p=0 "${filePath}"`,
-      { timeout: 10000 }
+      { timeout: 10000, stdio: ['ignore', 'pipe', 'pipe'] }
     ).toString().trim();
     const dur = parseFloat(output);
     if (isNaN(dur) || dur <= 0) {
@@ -138,25 +138,29 @@ async function buildDocumentaryVideo({
   console.log(`[${jobId}] Audio: ${totalDuration}s | Using ${nImages}/${imageUrls.length} images | ${imgDuration.toFixed(2)}s each`);
 
   // 3. Download selected images with fallback chain
-  console.log(`[${jobId}] Downloading ${nImages} images...`);
+  console.log(`[${jobId}] Downloading ${nImages} images (sequential, with delay)...`);
   for (let i = 0; i < selectedUrls.length; i++) {
     try {
+      console.log(`[${jobId}] → downloading image ${i + 1}/${nImages}: ${selectedUrls[i].substring(0, 80)}`);
       await downloadFile(selectedUrls[i], `${tmpDir}/image_${i + 1}.jpg`);
+      console.log(`[${jobId}] ✓ image ${i + 1} OK`);
     } catch(e) {
-      console.log(`[${jobId}] Image ${i + 1} failed: ${e.message}`);
+      console.log(`[${jobId}] ✗ image ${i + 1} failed: ${e.message}`);
       if (i > 0 && fs.existsSync(`${tmpDir}/image_${i}.jpg`)) {
         fs.copyFileSync(`${tmpDir}/image_${i}.jpg`, `${tmpDir}/image_${i + 1}.jpg`);
       } else {
-        execSync(`ffmpeg -y -f lavfi -i color=black:size=1080x1920:duration=1 -vframes 1 "${tmpDir}/image_${i + 1}.jpg"`, { maxBuffer: 1024 * 1024 * 10 });
+        execSync(`ffmpeg -y -f lavfi -i color=black:size=1080x1920:duration=1 -vframes 1 "${tmpDir}/image_${i + 1}.jpg"`, { maxBuffer: 1024 * 1024 * 10, stdio: ['ignore', 'ignore', 'pipe'] });
       }
     }
   }
+  console.log(`[${jobId}] All ${nImages} images downloaded/fallback complete`);
 
   // 4. PASS 1 — normalise each image to a uniform MP4 clip
   // (fixes mixed colorspace gray/yuvj420p/yuvj444p and mixed SAR that break
   // concat/xfade with heterogeneous web image sources)
   console.log(`[${jobId}] Pass 1: normalising ${nImages} clips...`);
   for (let i = 1; i <= nImages; i++) {
+    console.log(`[${jobId}] → normalising clip ${i}/${nImages}`);
     const cmd1 = `ffmpeg -y \
       -loop 1 -t ${imgDuration.toFixed(2)} -i "${tmpDir}/image_${i}.jpg" \
       -vf "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,format=yuv420p,setsar=1" \
@@ -164,8 +168,10 @@ async function buildDocumentaryVideo({
       "${tmpDir}/clip_${i}.mp4"`;
     const scriptPath1 = `${tmpDir}/run_pass1_${i}.sh`;
     fs.writeFileSync(scriptPath1, `#!/bin/sh\nset -e\n${cmd1}\n`);
-    execSync(`sh "${scriptPath1}"`, { timeout: 60000, maxBuffer: 1024 * 1024 * 50 });
+    execSync(`sh "${scriptPath1}"`, { timeout: 60000, maxBuffer: 1024 * 1024 * 50, stdio: ['ignore', 'ignore', 'pipe'] });
+    console.log(`[${jobId}] ✓ clip ${i} done`);
   }
+  console.log(`[${jobId}] Pass 1 complete — ${nImages} clips ready`);
   console.log(`[${jobId}] Pass 1 complete`);
 
   // 5. Build text overlay filters
@@ -223,7 +229,8 @@ async function buildDocumentaryVideo({
     "${outputPath}"`;
   const scriptPath2 = `${tmpDir}/run_pass2.sh`;
   fs.writeFileSync(scriptPath2, `#!/bin/sh\nset -e\n${ffmpegCmd2}\n`);
-  execSync(`sh "${scriptPath2}"`, { timeout: 900000, maxBuffer: 1024 * 1024 * 100 });
+  execSync(`sh "${scriptPath2}"`, { timeout: 900000, maxBuffer: 1024 * 1024 * 100, stdio: ['ignore', 'ignore', 'pipe'] });
+  console.log(`[${jobId}] Pass 2 ffmpeg command finished`);
   console.log(`[${jobId}] Render complete`);
 
   return { outputPath, totalDuration, nImages };
