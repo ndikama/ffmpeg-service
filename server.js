@@ -200,33 +200,45 @@ async function buildDocumentaryVideo({
     );
   });
 
-  const textChain = drawtextFilters.join(',');
+  const ctaDrawtextFilters = drawtextFilters; // alias, kept from earlier text filter construction
 
-  // 6. PASS 2 — concat normalised clips + audio + drawtext
-  const clipInputs = Array.from({length: nImages}, (_, i) => `-i "${tmpDir}/clip_${i+1}.mp4"`).join(' ');
-  const concatFilter = Array.from({length: nImages}, (_, i) => `[${i}:v]`).join('') +
-    `concat=n=${nImages}:v=1:a=0[vconcat];[vconcat]${textChain}[outv]`;
+  // 6. PASS 2 — concat normalised clips (via concat demuxer) + audio + drawtext
   const outputPath = `${tmpDir}/output.mp4`;
 
   console.log(`[${jobId}] Pass 2: assembling final video (${nImages} clips, ${totalDuration}s)...`);
-  // Write filter_complex to its own file too — with 25 images the filter string
-  // itself can be several KB, which some shells/Docker images choke on even
-  // inside a script. -filter_complex_script reads it directly from disk.
-  const filterScriptPath = `${tmpDir}/filter_complex.txt`;
-  fs.writeFileSync(filterScriptPath, concatFilter);
+
+  // FIX: use the concat DEMUXER (-f concat) with a simple file list instead of
+  // the filter_complex concat filter with N separate -i inputs. This collapses
+  // 25 "-i clip_N.mp4" arguments down to a single "-i concat_list.txt" input,
+  // which is the actual root cause of the ENOBUFS — too many process arguments,
+  // not the filter string length itself.
+  const concatListPath = `${tmpDir}/concat_list.txt`;
+  let concatContent = '';
+  for (let i = 1; i <= nImages; i++) {
+    concatContent += `file '${tmpDir}/clip_${i}.mp4'\n`;
+  }
+  fs.writeFileSync(concatListPath, concatContent);
+
+  // drawtext filters must be chained onto an explicit stream label.
+  // [0:v] here is the single concatenated video stream coming from the
+  // concat demuxer input (input index 0).
+  const textChain = ctaDrawtextFilters.length > 0
+    ? `[0:v]${ctaDrawtextFilters.join(',')}[outv]`
+    : `[0:v]copy[outv]`;
 
   const ffmpegCmd2 = `ffmpeg -y \
-    ${clipInputs} \
+    -f concat -safe 0 -i "${concatListPath}" \
     -i "${tmpDir}/audio.mp3" \
-    -filter_complex_script "${filterScriptPath}" \
+    -filter_complex "${textChain}" \
     -map "[outv]" \
-    -map ${nImages}:a \
+    -map 1:a \
     -c:v libx264 -preset fast -crf 22 \
     -c:a aac -b:a 192k \
     -t ${totalDuration} \
     -movflags +faststart \
     -pix_fmt yuv420p \
     "${outputPath}"`;
+
   const scriptPath2 = `${tmpDir}/run_pass2.sh`;
   fs.writeFileSync(scriptPath2, `#!/bin/sh\nset -e\n${ffmpegCmd2}\n`);
   execSync(`sh "${scriptPath2}"`, { timeout: 900000, maxBuffer: 1024 * 1024 * 100, stdio: ['ignore', 'ignore', 'pipe'] });
