@@ -24,7 +24,7 @@ app.get('/', (req, res) => {
   res.json({ status: 'ok', service: 'FFmpeg Assembly Service WF9b/WF10 v7 — Documentary style dynamic images' });
 });
 
-async function downloadFile(url, dest) {
+async function downloadFile(url, dest, timeoutMs = 30000) {
   let downloadUrl = url;
   if (url.includes('drive.google.com')) {
     const idMatch = url.match(/id=([^&]+)/);
@@ -35,7 +35,7 @@ async function downloadFile(url, dest) {
   const response = await axios({
     url: downloadUrl,
     responseType: 'stream',
-    timeout: 60000,
+    timeout: timeoutMs,
     headers: {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
       'Accept': '*/*'
@@ -138,22 +138,40 @@ async function buildDocumentaryVideo({
   console.log(`[${jobId}] Audio: ${totalDuration}s | Using ${nImages}/${imageUrls.length} images | ${imgDuration.toFixed(2)}s each`);
 
   // 3. Download selected images with fallback chain
-  console.log(`[${jobId}] Downloading ${nImages} images (sequential, with delay)...`);
+  // Timeout intentionally short (8s) — bad URLs (Facebook/Instagram crawlers,
+  // x-raw-image blobs, etc.) should fail fast and use the fallback copy rather
+  // than blocking the whole pipeline for 60s each.
+  console.log(`[${jobId}] Downloading ${nImages} images...`);
   for (let i = 0; i < selectedUrls.length; i++) {
+    const url = selectedUrls[i];
+    // Skip obviously invalid URLs immediately
+    const isInvalid = !url.startsWith('http') ||
+      url.includes('lookaside.fbsbx.com') ||
+      url.includes('lookaside.instagram.com') ||
+      url.startsWith('x-raw-image');
+    if (isInvalid) {
+      console.log(`[${jobId}] ⚠ image ${i + 1} skipped (blocked/invalid URL)`);
+      if (i > 0 && fs.existsSync(`${tmpDir}/image_${i}.jpg`)) {
+        fs.copyFileSync(`${tmpDir}/image_${i}.jpg`, `${tmpDir}/image_${i + 1}.jpg`);
+      } else {
+        execSync(`ffmpeg -y -f lavfi -i color=black:size=1080x1920:duration=1 -vframes 1 "${tmpDir}/image_${i + 1}.jpg"`, { stdio: ['ignore', 'ignore', 'pipe'] });
+      }
+      continue;
+    }
     try {
-      console.log(`[${jobId}] → downloading image ${i + 1}/${nImages}: ${selectedUrls[i].substring(0, 80)}`);
-      await downloadFile(selectedUrls[i], `${tmpDir}/image_${i + 1}.jpg`);
+      console.log(`[${jobId}] → image ${i + 1}: ${url.substring(0, 70)}`);
+      await downloadFile(url, `${tmpDir}/image_${i + 1}.jpg`, 8000);
       console.log(`[${jobId}] ✓ image ${i + 1} OK`);
     } catch(e) {
       console.log(`[${jobId}] ✗ image ${i + 1} failed: ${e.message}`);
       if (i > 0 && fs.existsSync(`${tmpDir}/image_${i}.jpg`)) {
         fs.copyFileSync(`${tmpDir}/image_${i}.jpg`, `${tmpDir}/image_${i + 1}.jpg`);
       } else {
-        execSync(`ffmpeg -y -f lavfi -i color=black:size=1080x1920:duration=1 -vframes 1 "${tmpDir}/image_${i + 1}.jpg"`, { maxBuffer: 1024 * 1024 * 10, stdio: ['ignore', 'ignore', 'pipe'] });
+        execSync(`ffmpeg -y -f lavfi -i color=black:size=1080x1920:duration=1 -vframes 1 "${tmpDir}/image_${i + 1}.jpg"`, { stdio: ['ignore', 'ignore', 'pipe'] });
       }
     }
   }
-  console.log(`[${jobId}] All ${nImages} images downloaded/fallback complete`);
+  console.log(`[${jobId}] Images ready`);
 
   // 4. PASS 1 — normalise each image to a uniform MP4 clip
   // (fixes mixed colorspace gray/yuvj420p/yuvj444p and mixed SAR that break
@@ -168,7 +186,7 @@ async function buildDocumentaryVideo({
       "${tmpDir}/clip_${i}.mp4"`;
     const scriptPath1 = `${tmpDir}/run_pass1_${i}.sh`;
     fs.writeFileSync(scriptPath1, `#!/bin/sh\nset -e\n${cmd1}\n`);
-    execSync(`sh "${scriptPath1}"`, { timeout: 60000, maxBuffer: 1024 * 1024 * 50, stdio: ['ignore', 'ignore', 'pipe'] });
+    execSync(`sh "${scriptPath1}"`, { timeout: 30000, maxBuffer: 1024 * 1024 * 50, stdio: ['ignore', 'ignore', 'pipe'] });
     console.log(`[${jobId}] ✓ clip ${i} done`);
   }
   console.log(`[${jobId}] Pass 1 complete — ${nImages} clips ready`);
